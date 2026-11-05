@@ -1,7 +1,6 @@
 import os
 import asyncio
 import logging
-from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -13,19 +12,24 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.contacts import ResolveUsernameRequest
 
 # --- КОНФИГУРАЦИЯ ---
-# В Render эти значения нужно задать в разделе Environment!
 BOT_TOKEN = os.getenv("BOT_TOKEN", "ВАШ_ТОКЕН_БОТА")
 API_ID = int(os.getenv("API_ID", "1234567"))
 API_HASH = os.getenv("API_HASH", "ВАШ_API_HASH")
 SESSION_STRING = os.getenv("SESSION_STRING", "")
 PORT = int(os.getenv("PORT", 8080))
 
+# ID пользователя, которому доступна моментальная проверка
+VIP_USER_ID = 6783917438
+
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Хранилище задач (ВНИМАНИЕ: При перезагрузке сервера Render этот список очистится)
+# Глобальная переменная для клиента Telethon
+global_telethon_client = None
+
+# Хранилище задач
 monitoring_tasks = {}
 
 # --- МАШИНА СОСТОЯНИЙ (FSM) ---
@@ -55,8 +59,9 @@ async def check_target_status(client: TelegramClient, target_type: str, username
                 await bot.get_chat(f"@{clean_username}")
                 return False, ""
             except Exception as e:
-                if "chat not found" in str(e).lower() or "blocked" in str(e).lower():
-                    return True, f"Бот @{clean_username} был удалён модерацией Telegram."
+                error_text = str(e).lower()
+                if "chat not found" in error_text or "user not found" in error_text or "blocked" in error_text:
+                    return True, f"Бот @{clean_username} был удалён модерацией Telegram (или владельцем)."
                 return False, ""
 
         elif target_type == 'account':
@@ -80,7 +85,6 @@ async def check_target_status(client: TelegramClient, target_type: str, username
                 entity = await client.get_entity(clean_username)
                 if hasattr(entity, 'restricted') and entity.restricted:
                     return True, f"Ресурс @{clean_username} заморожен модерацией."
-                # Проверка на плашку ToS (часто выдает ошибку при получении сущности)
                 return False, ""
             except errors.rpcerrorlist.ChannelBannedError:
                 return True, f"Канал/Группа @{clean_username} заблокирован(а) (нарушение ToS)."
@@ -93,18 +97,20 @@ async def check_target_status(client: TelegramClient, target_type: str, username
     return False, ""
 
 # --- ФОНОВЫЙ ЦИКЛ МОНИТОРИНГА ---
-async def monitoring_loop(client: TelegramClient):
-    while True:
-        await asyncio.sleep(600)  # Ждем 10 минут (600 секунд)
+async def monitoring_loop():
+    # Ждем инициализации клиента
+    while global_telethon_client is None:
+        await asyncio.sleep(1)
         
-        # Копируем список, чтобы избежать ошибок при изменении во время итерации
+    while True:
+        await asyncio.sleep(600)  # Ждем 10 минут
+        
         for user_id, targets in list(monitoring_tasks.items()):
             for target in targets[:]:
-                is_banned, msg = await check_target_status(client, target['type'], target['username'])
+                is_banned, msg = await check_target_status(global_telethon_client, target['type'], target['username'])
                 if is_banned:
                     try:
                         await bot.send_message(user_id, f"⚠️ **ВНИМАНИЕ**\n{msg}")
-                        # Удаляем из мониторинга, чтобы не спамить
                         targets.remove(target)
                     except Exception as e:
                         logging.error(f"Не удалось отправить сообщение {user_id}: {e}")
@@ -144,30 +150,51 @@ async def process_username(message: types.Message, state: FSMContext):
         return
 
     user_id = message.from_user.id
+    
+    # ==========================================
+    # ЛОГИКА МОМЕНТАЛЬНОЙ ПРОВЕРКИ ДЛЯ VIP-ЮЗЕРА
+    # ==========================================
+    if user_id == VIP_USER_ID:
+        status_msg = await message.answer(f"🔍 Делаю моментальную проверку @{username}...")
+        is_banned, msg = await check_target_status(global_telethon_client, target_type, username)
+        
+        if is_banned:
+            await status_msg.edit_text(
+                f"⚠️ **ВНИМАНИЕ**\n{msg}\n\n"
+                f"Ресурс **не добавлен** в мониторинг, так как уже заблокирован или удалён."
+            )
+            await state.clear()
+            return
+            
+        await status_msg.edit_text(f"✅ @{username} чист! Добавляю в общий мониторинг (проверка каждые 10 минут).")
+        
+    # ==========================================
+    # СТАНДАРТНАЯ ЛОГИКА ДЛЯ ВСЕХ ОСТАЛЬНЫХ
+    # ==========================================
+    else:
+        await message.answer(f"✅ @{username} добавлен в мониторинг!\nЯ проверяю его каждые 10 минут. Если Telegram его заблокирует, я сразу тебе напишу.")
+
+    # Добавляем в базу мониторинга (для всех)
     if user_id not in monitoring_tasks:
         monitoring_tasks[user_id] = []
     
-    # Добавляем в мониторинг
     monitoring_tasks[user_id].append({"type": target_type, "username": username})
-    
-    await message.answer(f"✅ @{username} добавлен в мониторинг!\nЯ проверяю его каждые 10 минут. Если Telegram его заблокирует, я сразу тебе напишу.")
     await state.clear()
 
 # --- ЗАПУСК ---
 async def main():
-    # 1. Запускаем веб-сервер (чтобы Render не ругался)
+    global global_telethon_client
+    
     await start_web_server()
     
-    # 2. Запускаем Telethon клиент (аккаунт-донор)
-    # Используем StringSession, чтобы не вводить СМС при каждом рестарте
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-    await client.start()
+    # Инициализируем и запускаем клиент
+    global_telethon_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    await global_telethon_client.start()
     logging.info("Telethon запущен.")
     
-    # 3. Запускаем фоновый мониторинг
-    asyncio.create_task(monitoring_loop(client))
+    # Запускаем фоновую задачу (передавать client в аргументы больше не нужно, он берет глобальный)
+    asyncio.create_task(monitoring_loop())
     
-    # 4. Запускаем бота
     logging.info("Бот запущен.")
     await dp.start_polling(bot)
 
